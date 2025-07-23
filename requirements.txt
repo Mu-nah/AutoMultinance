@@ -5,4 +5,4 @@ pandas
 ta
 gspread
 oauth2client
-pybit
+python-binance==1.0.17
