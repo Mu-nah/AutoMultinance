@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pandas as pd
 import threading
 from dotenv import load_dotenv
@@ -9,27 +9,25 @@ import ta
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from pybit.unified_trading import HTTP  # Bybit testnet
+from binance.client import Client
+from binance.enums import *
 from flask import Flask
 from collections import deque
 
 load_dotenv()
 
 # ✅ Config
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = "BTCUSDT"
 TRADE_QUANTITY = 0.001
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
-SPREAD_THRESHOLD = 50  # USD
+SPREAD_THRESHOLD = 15  # USD
 
-session = HTTP(
-    testnet=True,
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
-)
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
+client.futures_change_leverage(symbol=SYMBOL, leverage=10)
 
 # ✅ State
 in_position = False
@@ -38,7 +36,7 @@ sl_price = None
 tp_price = None
 trailing_peak = None
 current_trail_percent = 0.0
-trade_direction = None  # 'long' or 'short'
+trade_direction = None
 daily_trades = deque()
 
 RSI_LO, RSI_HI = 47, 53
@@ -68,17 +66,17 @@ def log_trade_to_sheet(data):
         pass
 
 # 📊 Get data
-def get_klines(interval='5'):
-    res = session.get_kline(category="linear", symbol=SYMBOL, interval=interval, limit=100)
-    k = res.get('result', {}).get('list', [])
-    df = pd.DataFrame(k, columns=[
+def get_klines(interval='5m', limit=100):
+    klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'turnover'  # last element not used
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
-    df['time'] = pd.to_datetime(pd.to_numeric(df['open_time']), unit='s')
+    df['time'] = pd.to_datetime(pd.to_numeric(df['open_time']), unit='ms')
     for col in ['open','high','low','close','volume']:
         df[col] = df[col].astype(float)
-    return df[::-1]  # reverse to get oldest first
+    return df
 
 # 📈 Indicators
 def add_indicators(df):
@@ -87,16 +85,17 @@ def add_indicators(df):
     df['bb_mid']  = bb.bollinger_mavg()
     df['bb_high'] = bb.bollinger_hband()
     df['bb_low']  = bb.bollinger_lband()
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
     return df
 
 # 📊 Signal logic
 def check_signal():
-    df_5m = add_indicators(get_klines('5'))
-    df_1h = add_indicators(get_klines('60'))
+    df_5m = add_indicators(get_klines('5m'))
+    df_1h = add_indicators(get_klines('1h'))
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     if now.minute >= 50:
         return None
 
@@ -113,35 +112,37 @@ def check_signal():
         return 'reversal_buy'
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
-
     return None
 
 # 🛠 Place order
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
 
-    orderbook = session.get_orderbook(category="linear", symbol=SYMBOL)
-    bid = float(orderbook['result'][0]['b'])
-    ask = float(orderbook['result'][0]['a'])
+    order_book = client.futures_order_book(symbol=SYMBOL)
+    ask = float(order_book['asks'][0][0])
+    bid = float(order_book['bids'][0][0])
     spread = ask - bid
     if spread > SPREAD_THRESHOLD:
         send_telegram(f"⚠ Spread too wide (${spread:.2f}), skipping trade.")
         return
 
-    side = "Buy" if 'buy' in order_type else "Sell"
+    side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
-    order = session.place_order(category="linear", symbol=SYMBOL, side=side,
-                                orderType="Market", qty=TRADE_QUANTITY, reduceOnly=False)
-    price = float(order.get('result', {}).get('avgFillPrice', bid if side=="Buy" else ask))
+    order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-    df_1h = add_indicators(get_klines('60'))
-    df_5m = add_indicators(get_klines('5'))
-    c1h = df_1h.iloc[-1]
+    df_5m = add_indicators(get_klines('5m'))
     c5 = df_5m.iloc[-1]
+    atr = c5['atr']
 
-    sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    tp_price = c5['bb_high'] if 'trend_buy' in order_type else c5['bb_low'] if 'trend_sell' in order_type else c5['bb_mid']
+    sl_price = c5['open'] if 'reversal' in order_type else c5['open']
+    tp_price = c5['bb_mid'] if 'reversal' in order_type else (c5['bb_high'] if 'trend_buy' in order_type else c5['bb_low'])
+
+    tp_distance = abs(tp_price - price)
+    if tp_distance < atr:
+        send_telegram(f"⚠ Skipping trade: TP too close ({tp_distance:.2f} < ATR {atr:.2f})")
+        return
 
     entry_price = price
     trailing_peak = price
@@ -149,13 +150,12 @@ def place_order(order_type):
     in_position = True
 
     send_telegram(f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}")
-    log_trade_to_sheet([str(datetime.now(timezone.utc)), SYMBOL, order_type, entry_price, sl_price, tp_price, f"Opened ({trade_direction})"])
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, f"Opened ({trade_direction})"])
 
 # 🔄 Manage trade
 def manage_trade():
     global in_position, trailing_peak, current_trail_percent
-    ticker = session.get_ticker(category="linear", symbol=SYMBOL)
-    price = float(ticker['result'][0]['lastPrice'])
+    price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
     profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
 
     if profit_pct >= 0.03:
@@ -167,35 +167,25 @@ def manage_trade():
 
     if current_trail_percent > 0:
         trailing_peak = max(trailing_peak, price) if trade_direction == 'long' else min(trailing_peak, price)
-        if trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent):
-            close_position(price, f"Trailing Stop Hit")
-            return
-        elif trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent):
-            close_position(price, f"Trailing Stop Hit")
+        if (trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent)) or \
+           (trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent)):
+            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
 
-    if trade_direction == 'long':
-        if price <= sl_price:
-            close_position(price, "Stop Loss Hit")
-        elif price >= tp_price:
-            close_position(price, "Take Profit Hit")
-    else:
-        if price >= sl_price:
-            close_position(price, "Stop Loss Hit")
-        elif price <= tp_price:
-            close_position(price, "Take Profit Hit")
+    if (trade_direction == 'long' and price <= sl_price) or (trade_direction == 'short' and price >= sl_price):
+        close_position(price, "Stop Loss Hit")
+    elif (trade_direction == 'long' and price >= tp_price) or (trade_direction == 'short' and price <= tp_price):
+        close_position(price, "Take Profit Hit")
 
 # ❌ Close trade
 def close_position(exit_price, reason):
     global in_position
-    side = "Sell" if trade_direction == 'long' else "Buy"
-    session.place_order(category="linear", symbol=SYMBOL, side=side,
-                        orderType="Market", qty=TRADE_QUANTITY, reduceOnly=True)
+    side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
+    client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
     pnl = round((exit_price - entry_price) if trade_direction == 'long' else (entry_price - exit_price), 2)
     daily_trades.append((pnl, pnl > 0))
-
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
-    log_trade_to_sheet([str(datetime.now(timezone.utc)), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False
 
 # 📊 Daily summary
@@ -204,9 +194,17 @@ def send_daily_summary():
         send_telegram("📊 Daily Summary:\nNo trades today.")
         return
     total_pnl = sum(p for p, _ in daily_trades)
-    win_rate = (sum(1 for _, win in daily_trades if win) / len(daily_trades)) * 100
-    msg = (f"📊 *Daily Summary* (UTC)\nTotal trades: {len(daily_trades)}\nWin rate: {win_rate:.1f}%\n"
-           f"Total PnL: {total_pnl:.2f}")
+    win_rate = sum(1 for _, win in daily_trades if win) / len(daily_trades) * 100
+    biggest_win = max((p for p, _ in daily_trades if p > 0), default=0)
+    biggest_loss = min((p for p, _ in daily_trades if p < 0), default=0)
+    msg = (
+        f"📊 *Daily Summary* (UTC)\n"
+        f"Total trades: {len(daily_trades)}\n"
+        f"Win rate: {win_rate:.1f}%\n"
+        f"Total PnL: {total_pnl:.2f}\n"
+        f"Biggest win: {biggest_win}\n"
+        f"Biggest loss: {biggest_loss}"
+    )
     send_telegram(msg)
     daily_trades.clear()
 
@@ -227,15 +225,17 @@ def bot_loop():
 # 🕒 Daily scheduler
 def daily_scheduler():
     while True:
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
         send_daily_summary()
 
-# 🌐 Flask
+# 🌐 Flask app
 app = Flask(__name__)
+
 @app.route('/')
-def home(): return "🚀 Bybit bot running!"
+def home():
+    return "🚀 Live bot running!"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
