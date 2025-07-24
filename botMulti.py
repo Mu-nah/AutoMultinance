@@ -38,8 +38,8 @@ sl_price = None
 tp_price = None
 trailing_peak = None
 current_trail_percent = 0.0
-trade_direction = None  # 'long' or 'short'
-daily_trades = deque()  # store (pnl, is_win)
+trade_direction = None
+daily_trades = deque()
 target_hit = False
 
 # 📩 Telegram
@@ -75,7 +75,7 @@ def get_klines(interval='5m', limit=100):
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     df['time'] = pd.to_datetime(df['open_time'].astype(float), unit='ms')
-    for col in ['open','high','low','close','volume']:
+    for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = df[col].astype(float)
     return df
 
@@ -96,15 +96,15 @@ def check_signal():
     df_5m = add_indicators(get_klines('5m'))
     df_1h = add_indicators(get_klines('1h'))
     df_1d = add_indicators(get_klines('1d'))
-    c5 = df_5m.iloc[-1]   # current still-forming 5m candle
-    c1h = df_1h.iloc[-1]  # current 1h candle
-    c1d = df_1d.iloc[-1]  # current daily candle
+    c5 = df_5m.iloc[-1]
+    c1h = df_1h.iloc[-1]
+    c1d = df_1d.iloc[-1]
 
     now = datetime.now(timezone.utc) + timedelta(hours=1)  # WAT
     if now.minute >= 50:
         return None
 
-    # Require 1H and daily candles align: both green or both red
+    # Require 1H and daily candles to align (both green or both red)
     if (c1h['close'] > c1h['open'] and c1d['close'] < c1d['open']) or \
        (c1h['close'] < c1h['open'] and c1d['close'] > c1d['open']):
         return None
@@ -147,8 +147,19 @@ def place_order(order_type):
     df_5m = add_indicators(get_klines('5m'))
     c1h = df_1h.iloc[-1]
     c5 = df_5m.iloc[-1]
+
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    tp_price = c5['bb_high'] if 'trend_buy' in order_type else c5['bb_low'] if 'trend_sell' in order_type else c5['bb_mid']
+
+    # ✅ Always TP in profit direction
+    if 'trend_buy' in order_type:
+        tp_price = max(c5['bb_high'], price + 20)
+    elif 'trend_sell' in order_type:
+        tp_price = min(c5['bb_low'], price - 20)
+    else:  # reversal
+        if 'buy' in order_type:
+            tp_price = max(c5['bb_mid'], price + 10)
+        else:
+            tp_price = min(c5['bb_mid'], price - 10)
 
     entry_price = price
     trailing_peak = price
