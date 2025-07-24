@@ -21,11 +21,12 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = "BTCUSDT"
 TRADE_QUANTITY = 0.001
+SPREAD_THRESHOLD = 15  # USD
+DAILY_TARGET = 1000  # USD
+RSI_LO, RSI_HI = 46, 54
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
-SPREAD_THRESHOLD = 20  # USD
-DAILY_TARGET = 1000  # USD
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
 client.futures_change_leverage(symbol=SYMBOL, leverage=10)
@@ -40,8 +41,6 @@ current_trail_percent = 0.0
 trade_direction = None  # 'long' or 'short'
 daily_trades = deque()  # store (pnl, is_win)
 target_hit = False
-
-RSI_LO, RSI_HI = 46, 54
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -76,7 +75,7 @@ def get_klines(interval='5m', limit=100):
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     df['time'] = pd.to_datetime(df['open_time'].astype(float), unit='ms')
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    for col in ['open','high','low','close','volume']:
         df[col] = df[col].astype(float)
     return df
 
@@ -96,41 +95,39 @@ def check_signal():
 
     df_5m = add_indicators(get_klines('5m'))
     df_1h = add_indicators(get_klines('1h'))
-    df_1d = get_klines('1d', limit=2)
-    c5, c1h = df_5m.iloc[-1], df_1h.iloc[-1]
-    daily = df_1d.iloc[-1]
+    df_1d = add_indicators(get_klines('1d'))
+    c5 = df_5m.iloc[-1]   # current still-forming 5m candle
+    c1h = df_1h.iloc[-1]  # current 1h candle
+    c1d = df_1d.iloc[-1]  # current daily candle
 
-    now = datetime.utcnow() + timedelta(hours=1)  # to WAT
+    now = datetime.now(timezone.utc) + timedelta(hours=1)  # WAT
     if now.minute >= 50:
         return None
 
-    daily_is_bullish = daily['close'] > daily['open']
-    daily_is_bearish = daily['close'] < daily['open']
+    # Require 1H and daily candles align: both green or both red
+    if (c1h['close'] > c1h['open'] and c1d['close'] < c1d['open']) or \
+       (c1h['close'] < c1h['open'] and c1d['close'] > c1d['open']):
+        return None
 
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    # Trend Buy
-    if daily_is_bullish and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open'] and c1d['close'] > c1d['open']:
         return 'trend_buy'
-    # Trend Sell
-    if daily_is_bearish and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open'] and c1d['close'] < c1d['open']:
         return 'trend_sell'
-    # Reversal Buy
-    if daily_is_bullish and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open'] and c1d['close'] > c1d['open']:
         return 'reversal_buy'
-    # Reversal Sell
-    if daily_is_bearish and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open'] and c1d['close'] < c1d['open']:
         return 'reversal_sell'
-
     return None
 
 # 🛠 Place order
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
-    if target_hit:
+    if target_hit or in_position:
         return
 
     order_book = client.futures_order_book(symbol=SYMBOL)
@@ -253,7 +250,7 @@ def bot_loop():
 # 🕒 Daily scheduler
 def daily_scheduler():
     while True:
-        now = datetime.utcnow() + timedelta(hours=1)  # to WAT
+        now = datetime.utcnow() + timedelta(hours=1)  # WAT
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
         send_daily_summary()
