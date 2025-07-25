@@ -161,11 +161,11 @@ def cancel_pending_if_needed():
 def send_daily_summary():
     global target_hit
     if not daily_trades:
-        send_telegram("📊 *Daily Summary:*\n_No trades today._")
+        send_telegram("📊 *Yesterday Summary:*\n_No trades._")
         return
     total_pnl = sum(p for p,_ in daily_trades)
     num_wins = sum(1 for _,w in daily_trades if w)
-    msg = f"""📊 *Daily Summary*
+    msg = f"""📊 *Yesterday Summary*
 Total Trades: *{len(daily_trades)}*
 Win Rate: *{(num_wins/len(daily_trades))*100:.1f}%*
 Total PnL: *{total_pnl:.2f}*
