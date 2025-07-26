@@ -105,7 +105,7 @@ def place_order(order_type):
 """)
     log_trade_to_sheet([str(datetime.utcnow()),SYMBOL,order_type,stop,sl_price,tp_price,f"Pending({trade_direction})"])
 
-# ✅ Track & manage trade
+# ✅ Track & manage trade (TSL updated)
 def manage_trade():
     global in_position,entry_price,trailing_peak,current_trail_percent
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -122,9 +122,12 @@ def manage_trade():
     if profit_pct>=0.03: current_trail_percent=0.015
     elif profit_pct>=0.02: current_trail_percent=0.01
     elif profit_pct>=0.01: current_trail_percent=0.005
-    trailing_peak=max(trailing_peak,price) if trade_direction=='long' else min(trailing_peak,price)
-    if trade_direction=='long' and price<trailing_peak*(1-current_trail_percent): close_position(price,"Trailing Stop Hit"); return
-    if trade_direction=='short' and price>trailing_peak*(1+current_trail_percent): close_position(price,"Trailing Stop Hit"); return
+    # ✅ Update trailing peak only in favor
+    if trade_direction=='long' and price>trailing_peak: trailing_peak=price
+    if trade_direction=='short' and price<trailing_peak: trailing_peak=price
+    if current_trail_percent>0:
+        if trade_direction=='long' and price<trailing_peak*(1-current_trail_percent): close_position(price,"Trailing Stop Hit"); return
+        if trade_direction=='short' and price>trailing_peak*(1+current_trail_percent): close_position(price,"Trailing Stop Hit"); return
     if trade_direction=='long':
         if price<=sl_price: close_position(price,"Stop Loss Hit")
         elif price>=tp_price: close_position(price,"Take Profit Hit")
@@ -175,7 +178,6 @@ Biggest Loss: *{min((p for p,_ in daily_trades if p<0),default=0)}*
     send_telegram(msg)
     daily_trades.clear()
     target_hit = False
-
 
 # 🚀 Bot loop
 def bot_loop():
