@@ -73,30 +73,39 @@ def check_signal():
     if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open'] and c1d['close']<c1d['open']: return 'trend_sell'
     return None
 
-# 🛠 Place stop order
+# 🛠 Place stop order (✅ fixed: only one order per direction)
 def place_order(order_type):
     global pending_order_id,pending_order_side,pending_order_time,sl_price,tp_price,trade_direction
     if target_hit or in_position: return
     side='buy' if 'buy' in order_type else 'sell'
-    if pending_order_id and pending_order_side!=side:
+    
+    # ✅ if already pending order in same side, skip
+    if pending_order_id and pending_order_side == side: return
+
+    # if pending order in opposite side, cancel it
+    if pending_order_id and pending_order_side != side:
         try: client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
         except: pass
         send_telegram("⚠ *Canceled previous pending order due to opposite signal*")
         pending_order_id=None
+
     ob=client_live.futures_order_book(symbol=SYMBOL)
     ask,bid=float(ob['asks'][0][0]),float(ob['bids'][0][0])
     if ask-bid>SPREAD_THRESHOLD:
         send_telegram(f"⚠ *Spread too wide* (${ask-bid:.2f}), skipping trade.")
         return
+
     stop=round(ask+ENTRY_BUFFER,2) if 'buy' in order_type else round(bid-ENTRY_BUFFER,2)
     df_1h,df_5m=add_indicators(get_klines('1h')),add_indicators(get_klines('5m'))
     c1h,c5=df_1h.iloc[-1],df_5m.iloc[-1]
     sl_price=c1h['open'] if 'trend' in order_type else c5['open']
     tp_price=max(stop,c5['bb_high']) if 'buy' in order_type else min(stop,c5['bb_low'])
     trade_direction='long' if 'buy' in order_type else 'short'
+
     res=client_testnet.futures_create_order(symbol=SYMBOL,side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
                                            type=FUTURE_ORDER_TYPE_STOP_MARKET,stopPrice=stop,quantity=TRADE_QUANTITY)
     pending_order_id,pending_order_side,pending_order_time=res['orderId'],side,datetime.utcnow()
+
     send_telegram(f"""🟩 *STOP ORDER PLACED*
 *Type:* `{order_type.upper()}`
 *Price:* `{stop}`
@@ -105,7 +114,7 @@ def place_order(order_type):
 """)
     log_trade_to_sheet([str(datetime.utcnow()),SYMBOL,order_type,stop,sl_price,tp_price,f"Pending({trade_direction})"])
 
-# ✅ Track & manage trade (TSL updated)
+# ✅ Track & manage trade with trailing stop
 def manage_trade():
     global in_position,entry_price,trailing_peak,current_trail_percent
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -115,16 +124,14 @@ def manage_trade():
             if order['status']=='FILLED':
                 in_position,pending_order_id=True,None
                 entry_price,trailing_peak=float(order['avgFillPrice']),float(order['avgFillPrice'])
-                send_telegram(f"✅ *STOP order triggered*\n*Entry Price:* `{entry_price}`\n*Direction:* `{trade_direction.upper()}`")
+                send_telegram(f"✅ *STOP order triggered*\n*Entry:* `{entry_price}`\n*Dir:* `{trade_direction.upper()}`")
         except: pass
     if not in_position: return
     profit_pct=abs((price-entry_price)/entry_price) if entry_price else 0
     if profit_pct>=0.03: current_trail_percent=0.015
     elif profit_pct>=0.02: current_trail_percent=0.01
     elif profit_pct>=0.01: current_trail_percent=0.005
-    # ✅ Update trailing peak only in favor
-    if trade_direction=='long' and price>trailing_peak: trailing_peak=price
-    if trade_direction=='short' and price<trailing_peak: trailing_peak=price
+    trailing_peak=max(trailing_peak,price) if trade_direction=='long' else min(trailing_peak,price)
     if current_trail_percent>0:
         if trade_direction=='long' and price<trailing_peak*(1-current_trail_percent): close_position(price,"Trailing Stop Hit"); return
         if trade_direction=='short' and price>trailing_peak*(1+current_trail_percent): close_position(price,"Trailing Stop Hit"); return
@@ -144,7 +151,7 @@ def close_position(exit_price,reason):
     daily_trades.append((pnl,pnl>0))
     if sum(p for p,_ in daily_trades)>=DAILY_TARGET: target_hit=True
     send_telegram(f"""❌ *TRADE CLOSED*
-*Exit Price:* `{exit_price}`
+*Exit:* `{exit_price}`
 *Reason:* `{reason}`
 *PnL:* `{pnl}`
 """)
@@ -187,7 +194,7 @@ def bot_loop():
             if s: place_order(s)
             else: manage_trade()
         except: pass
-        time.sleep(120)
+        time.sleep(180)
 
 # 🕒 Daily scheduler
 def daily_scheduler():
