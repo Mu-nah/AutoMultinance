@@ -185,7 +185,7 @@ def bot_loop():
             if s: place_order(s)
             else: manage_trade()
         except: pass
-        time.sleep(180)
+        time.sleep(120)
 
 # 🕒 Daily scheduler
 def daily_scheduler():
