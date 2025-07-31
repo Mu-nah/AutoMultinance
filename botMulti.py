@@ -12,13 +12,14 @@ load_dotenv()
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 BASE_URL = "https://api-testnet.bybit.com"
-SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 17, 1000
+SYMBOL, TRADE_QUANTITY, DAILY_TARGET = "BTCUSDT", 0.001, 1000
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
 TELEGRAM_TOKEN, CHAT_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
 
 # ✅ State
 in_position, pending_order_time = False, None
-entry_price, sl_price, tp_price, trailing_peak, trailing_stop_price, current_trail_percent = None, None, None, None, None, 0.0
+entry_price, sl_price, tp_price = None, None, None
+trailing_peak, trailing_stop_price, current_trail_percent = None, None, 0.0
 trade_direction, daily_trades, target_hit = None, deque(), False
 
 # 📩 Telegram
@@ -28,32 +29,36 @@ def send_telegram(msg):
                       data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
     except: pass
 
-# 📊 Get klines
+# 📊 Fetch klines from Bybit
 def get_klines(interval='5'):
     ts = str(int(time.time() * 1000))
-    params = {
-        "category": "linear", "symbol": SYMBOL, "interval": interval, "limit": 100, "start": int(time.time()) - 100*60*int(interval)
-    }
-    query = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
-    sign = hmac.new(BYBIT_API_SECRET.encode(), (ts + BYBIT_API_KEY + "5000" + query).encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": "5000",
-        "X-BAPI-SIGN": sign
-    }
-    r = requests.get(f"{BASE_URL}/v5/market/kline?" + query, headers=headers).json()
+    params = {"category": "linear", "symbol": SYMBOL, "interval": interval, "limit": 100}
+    query = '&'.join(f"{k}={v}" for k,v in sorted(params.items()))
+    sign = hmac.new(BYBIT_API_SECRET.encode(), (ts+BYBIT_API_KEY+"5000"+query).encode(), hashlib.sha256).hexdigest()
+    headers = {"X-BAPI-API-KEY": BYBIT_API_KEY,"X-BAPI-TIMESTAMP": ts,"X-BAPI-RECV-WINDOW": "5000","X-BAPI-SIGN": sign}
+    r = requests.get(f"{BASE_URL}/v5/market/kline?"+query, headers=headers).json()
     df = pd.DataFrame(r['result']['list'])
-    df.columns = ['start','open','high','low','close','volume','turnover']
-    df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')  # ✅ fix warning
+    df.columns=['start','open','high','low','close','volume','turnover']
+    df['time']=pd.to_datetime(pd.to_numeric(df['start']), unit='s')
     for c in ['open','high','low','close','volume']: df[c]=df[c].astype(float)
     return df
 
+# ✅ Add RSI & Bollinger Bands
 def add_indicators(df):
     df['rsi']=ta.momentum.rsi(df['close'],14)
     bb=ta.volatility.BollingerBands(df['close'],20,2)
     df['bb_mid'],df['bb_high'],df['bb_low']=bb.bollinger_mavg(),bb.bollinger_hband(),bb.bollinger_lband()
     return df
+
+# 📈 Fetch live price
+def get_live_price():
+    ts=str(int(time.time()*1000))
+    params={"category":"linear","symbol":SYMBOL}
+    query='&'.join(f"{k}={v}" for k,v in sorted(params.items()))
+    sign=hmac.new(BYBIT_API_SECRET.encode(),(ts+BYBIT_API_KEY+"5000"+query).encode(),hashlib.sha256).hexdigest()
+    headers={"X-BAPI-API-KEY":BYBIT_API_KEY,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":"5000","X-BAPI-SIGN":sign}
+    r=requests.get(f"{BASE_URL}/v5/market/ticker?"+query,headers=headers).json()
+    return float(r['result']['list'][0]['lastPrice'])
 
 # 📊 Signal logic
 def check_signal():
@@ -70,33 +75,37 @@ def check_signal():
     if c5['close']>c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 
-# 🛠 Place order
+# 🛠 Place market order
 def place_order(order_type):
-    global sl_price,tp_price,trade_direction,pending_order_time,in_position,entry_price
+    global sl_price,tp_price,trade_direction,pending_order_time,in_position,entry_price,trailing_peak,trailing_stop_price,current_trail_percent
     side="Buy" if "buy" in order_type else "Sell"
     df=add_indicators(get_klines('5'))
     c5=df.iloc[-1]
     sl_price,tp_price=(c5['open'],round(c5['bb_high']+100,2)) if side=="Buy" else (c5['open'],round(c5['bb_low']-100,2))
     trade_direction='long' if side=="Buy" else 'short'
+
     ts=str(int(time.time()*1000))
-    body={"category":"linear","symbol":SYMBOL,"side":side,"orderType":"Market","qty":"0.001","timeInForce":"GTC"}
+    body={"category":"linear","symbol":SYMBOL,"side":side,"orderType":"Market","qty":str(TRADE_QUANTITY),"timeInForce":"GTC"}
     body_json=json.dumps(body,separators=(',',':'))
     sign=hmac.new(BYBIT_API_SECRET.encode(),(ts+BYBIT_API_KEY+"5000"+body_json).encode(),hashlib.sha256).hexdigest()
     headers={"X-BAPI-API-KEY":BYBIT_API_KEY,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":"5000","X-BAPI-SIGN":sign,"Content-Type":"application/json"}
     r=requests.post(f"{BASE_URL}/v5/order/create",headers=headers,data=body_json).json()
+
     send_telegram(f"🟩 *ORDER PLACED*\n*Type:* `{order_type}`\nSL:`{sl_price}` TP:`{tp_price}`")
     pending_order_time=datetime.utcnow()
     in_position=True
     entry_price=c5['close']
+    trailing_peak,trailing_stop_price,current_trail_percent=entry_price,None,0.0
 
-# 🔄 Trailing stop
+# 🔄 Manage open trade
 def manage_trade():
     global trailing_peak,trailing_stop_price,current_trail_percent,in_position
-    price=entry_price # for demo; real: get live price
+    price=get_live_price()
     profit_pct=abs((price-entry_price)/entry_price)
     if profit_pct>=0.03: current_trail_percent=0.015
     elif profit_pct>=0.02: current_trail_percent=0.01
     elif profit_pct>=0.01: current_trail_percent=0.005
+
     if trade_direction=='long':
         if trailing_peak is None or price>trailing_peak: trailing_peak=price; trailing_stop_price=price*(1-current_trail_percent)
         if current_trail_percent>0 and price<=trailing_stop_price: close_position(price,"Trailing Stop Hit")
@@ -108,7 +117,7 @@ def manage_trade():
         elif price<=tp_price: close_position(price,"Take Profit Hit")
         elif price>=sl_price: close_position(price,"Stop Loss Hit")
 
-# ❌ Close
+# ❌ Close trade
 def close_position(price,reason):
     global in_position
     in_position=False
@@ -127,14 +136,17 @@ def daily_report_loop():
         send_telegram(msg)
         daily_trades.clear()
 
-# 🚀 Bot loop
+# 🚀 Main bot loop
 def bot_loop():
     global in_position
     while True:
-        if not in_position:
-            s=check_signal()
-            if s: place_order(s)
-        else: manage_trade()
+        try:
+            if not in_position:
+                s=check_signal()
+                if s: place_order(s)
+            else: manage_trade()
+        except Exception as e:
+            print("Error:", e)
         time.sleep(120)
 
 # 🌐 Flask
