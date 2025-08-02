@@ -1,4 +1,4 @@
-I wan t this bot to trade ETHUSDT; import os, time, json
+import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
 from dotenv import load_dotenv
