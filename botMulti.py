@@ -1,6 +1,6 @@
 import os, time, json, hmac, hashlib, threading, requests
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from flask import Flask
 from collections import deque
@@ -113,7 +113,7 @@ def place_stop_order(order_type, entry):
     else:
         send_telegram(f"❌ Failed to place order: {r.get('retMsg')}")
 
-# === FORMING CANDLE FETCHER (REST + TICKER) ===
+# === FORMING CANDLE FETCHER ===
 def get_forming_candles(interval='5'):
     try:
         # Step 1: Get last 2 klines
@@ -130,22 +130,22 @@ def get_forming_candles(interval='5'):
         df = pd.DataFrame(raw, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
         df["start"] = pd.to_numeric(df["start"], errors="coerce")
         df["time"] = pd.to_datetime(df["start"], unit='ms', errors='coerce')
-        for col in ["open", "high", "low", "close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Convert price columns to float
+        df[["open", "high", "low", "close", "volume", "turnover"]] = df[["open", "high", "low", "close", "volume", "turnover"]].astype(float)
         df = df.dropna(subset=["time", "open", "high", "low", "close"])
 
-        # Step 2: Get ticker for live close
-        ticker_params = {"category": CATEGORY, "symbol": SYMBOL}
-        ticker = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params=ticker_params).json()
+        # Step 2: Get ticker
+        ticker = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}).json()
         ticker_data = ticker.get("result", {}).get("list", [])
         if not ticker_data: return df
 
         last_price = float(ticker_data[0]["lastPrice"])
 
-        # Step 3: Update forming candle
-        df.iloc[-1, df.columns.get_loc("close")] = last_price
-        df.iloc[-1, df.columns.get_loc("high")] = max(df.iloc[-1]["high"], last_price)
-        df.iloc[-1, df.columns.get_loc("low")] = min(df.iloc[-1]["low"], last_price)
+        # Step 3: Update forming candle safely
+        df.at[df.index[-1], "close"] = last_price
+        df.at[df.index[-1], "high"] = max(df.iloc[-1]["high"], last_price)
+        df.at[df.index[-1], "low"] = min(df.iloc[-1]["low"], last_price)
 
         return df
     except Exception as e:
@@ -168,7 +168,7 @@ def get_bollinger_band_reference(order_type):
     c = df.iloc[-1]
     return c["bb_mid"] if "reversal" in order_type else (c["bb_high"] if "buy" in order_type else c["bb_low"])
 
-# === SIGNALS ===
+# === SIGNAL LOGIC ===
 def check_signal():
     global last_tp_time, target_hit
 
@@ -196,7 +196,7 @@ def check_signal():
         return "reversal_sell", c5["close"]
     return None
 
-# === MAIN LOOP ===
+# === MAIN BOT LOOP ===
 def bot_loop():
     global in_position, last_tp_time, daily_trades, target_hit, pending_order, entry_price
 
@@ -218,7 +218,7 @@ def bot_loop():
             send_telegram(f"⚠ Error: {e}")
         time.sleep(60)
 
-# === FLASK SERVER + DAILY REPORT ===
+# === FLASK REPORT SERVER ===
 app = Flask(__name__)
 
 @app.route('/')
