@@ -37,6 +37,7 @@ sl_price = None
 tp_price = None
 trade_direction = None
 pending_order = None
+pending_order_time = None
 daily_trades = deque()
 target_hit = False
 last_tp_time = None
@@ -67,7 +68,7 @@ def sign_request(timestamp, recv_window, body=""):
     return hmac.new(BYBIT_TESTNET_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 def place_stop_order(order_type, entry):
-    global pending_order, sl_price, tp_price, trade_direction
+    global pending_order, sl_price, tp_price, trade_direction, pending_order_time
 
     side = "Buy" if "buy" in order_type else "Sell"
     direction = "long" if side == "Buy" else "short"
@@ -103,6 +104,7 @@ def place_stop_order(order_type, entry):
 
     if r.get("retCode") == 0:
         pending_order = {"id": r["result"]["orderId"], "side": side, "entry": entry}
+        pending_order_time = datetime.utcnow()
         sl_price, tp_price, trade_direction = sl, tp, direction
         msg = f"🟩 *{order_type.upper()}* placed\n📍 Entry: `{entry}`\n🎯 TP: `{tp}`\n🛡 SL: `{sl}`"
         send_telegram(msg)
@@ -122,9 +124,17 @@ def get_klines(interval='5'):
     df = pd.DataFrame(r['result']['list'], columns=[
         "start", "open", "high", "low", "close", "volume", "turnover"
     ])
-    df["time"] = pd.to_datetime(pd.to_numeric(df["start"]), unit='s')
-    for c in ['open', 'high', 'low', 'close']: df[c] = df[c].astype(float)
-    return df
+
+    # ✅ FIX: clean and convert timestamp
+    df["start"] = pd.to_numeric(df["start"], errors="coerce")
+    df = df.dropna(subset=["start"])
+    df = df[(df["start"] > 1e9) & (df["start"] < 2e10)]
+    df["time"] = pd.to_datetime(df["start"], unit='s', errors='coerce')
+    df = df.dropna(subset=["time"])
+
+    for c in ['open', 'high', 'low', 'close']:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna()
 
 def add_indicators(df):
     df["rsi"] = ta.momentum.rsi(df["close"], 14)
@@ -167,7 +177,7 @@ def check_signal():
 
 # === MAIN LOOP ===
 def bot_loop():
-    global in_position, last_tp_time, daily_trades, target_hit
+    global in_position, last_tp_time, daily_trades, target_hit, pending_order
 
     while True:
         try:
@@ -176,9 +186,9 @@ def bot_loop():
                 if signal:
                     order_type, signal_price = signal
                     place_stop_order(order_type, signal_price)
-            # simulate fill check
-            if pending_order:
-                # for demo purposes, assume filled after 60s
+
+            # Simulated fill logic
+            if pending_order and pending_order_time:
                 if not in_position and (datetime.utcnow() - pending_order_time).seconds > 60:
                     in_position = True
                     entry_price = pending_order['entry']
@@ -201,6 +211,7 @@ def daily_report():
         now = datetime.utcnow()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
+
         total_pnl = sum(p for p,_ in daily_trades)
         win_rate = (sum(1 for _,w in daily_trades if w) / len(daily_trades))*100 if daily_trades else 0
         max_win = max((p for p,_ in daily_trades), default=0)
