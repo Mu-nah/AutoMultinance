@@ -1,6 +1,6 @@
 import os, time, json, hmac, hashlib, threading, requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask
 from collections import deque
@@ -62,11 +62,12 @@ def log_trade(data):
         sheet.append_row(data)
     except: pass
 
-# === BYBIT REQUESTS ===
+# === BYBIT SIGNED REQUEST ===
 def sign_request(timestamp, recv_window, body=""):
     message = BYBIT_TESTNET_API_KEY + str(timestamp) + str(recv_window) + body
     return hmac.new(BYBIT_TESTNET_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
+# === ORDER PLACEMENT ===
 def place_stop_order(order_type, entry):
     global pending_order, sl_price, tp_price, trade_direction, pending_order_time
 
@@ -112,33 +113,46 @@ def place_stop_order(order_type, entry):
     else:
         send_telegram(f"❌ Failed to place order: {r.get('retMsg')}")
 
-# === KLINE CLEANING ===
-def get_klines(interval='5'):
+# === FORMING CANDLE FETCHER (REST + TICKER) ===
+def get_forming_candles(interval='5'):
     try:
+        # Step 1: Get last 2 klines
         params = {
             "category": CATEGORY,
             "symbol": SYMBOL,
             "interval": interval,
-            "limit": 100
+            "limit": 2
         }
         r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params=params).json()
         raw = r.get("result", {}).get("list", [])
         if not raw: return pd.DataFrame()
-        df = pd.DataFrame(raw, columns=[
-            "start", "open", "high", "low", "close", "volume", "turnover"
-        ])
+
+        df = pd.DataFrame(raw, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
         df["start"] = pd.to_numeric(df["start"], errors="coerce")
-        df = df.dropna(subset=["start"])
-        df = df[(df["start"] > 1e9) & (df["start"] < 2e10)]
-        df["time"] = pd.to_datetime(df["start"], unit='s', errors='coerce')
-        df = df.dropna(subset=["time"])
+        df["time"] = pd.to_datetime(df["start"], unit='ms', errors='coerce')
         for col in ["open", "high", "low", "close"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.dropna(subset=["time", "open", "high", "low", "close"])
+
+        # Step 2: Get ticker for live close
+        ticker_params = {"category": CATEGORY, "symbol": SYMBOL}
+        ticker = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params=ticker_params).json()
+        ticker_data = ticker.get("result", {}).get("list", [])
+        if not ticker_data: return df
+
+        last_price = float(ticker_data[0]["lastPrice"])
+
+        # Step 3: Update forming candle
+        df.iloc[-1, df.columns.get_loc("close")] = last_price
+        df.iloc[-1, df.columns.get_loc("high")] = max(df.iloc[-1]["high"], last_price)
+        df.iloc[-1, df.columns.get_loc("low")] = min(df.iloc[-1]["low"], last_price)
+
         return df
-    except:
+    except Exception as e:
+        print(f"❌ Error in get_forming_candles({interval}m): {e}")
         return pd.DataFrame()
 
+# === INDICATORS ===
 def add_indicators(df):
     if df.empty: return df
     df["rsi"] = ta.momentum.rsi(df["close"], 14)
@@ -149,7 +163,7 @@ def add_indicators(df):
     return df
 
 def get_bollinger_band_reference(order_type):
-    df = add_indicators(get_klines('5'))
+    df = add_indicators(get_forming_candles('5'))
     if df.empty: return None
     c = df.iloc[-1]
     return c["bb_mid"] if "reversal" in order_type else (c["bb_high"] if "buy" in order_type else c["bb_low"])
@@ -161,8 +175,8 @@ def check_signal():
     if target_hit: return None
     if last_tp_time and (datetime.utcnow() - last_tp_time).seconds < 1800: return None
 
-    df_5m = add_indicators(get_klines('5'))
-    df_1h = add_indicators(get_klines('60'))
+    df_5m = add_indicators(get_forming_candles('5'))
+    df_1h = add_indicators(get_forming_candles('60'))
 
     if df_5m.empty or df_1h.empty:
         return None
@@ -204,7 +218,7 @@ def bot_loop():
             send_telegram(f"⚠ Error: {e}")
         time.sleep(60)
 
-# === FLASK + DAILY REPORT ===
+# === FLASK SERVER + DAILY REPORT ===
 app = Flask(__name__)
 
 @app.route('/')
@@ -232,6 +246,7 @@ Biggest Loss: {max_loss}
         daily_trades.clear()
         target_hit = False
 
+# === RUN ===
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=daily_report, daemon=True).start()
