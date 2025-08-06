@@ -1,6 +1,6 @@
 import os, time, json, hmac, hashlib, threading, requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask
 from collections import deque
@@ -16,7 +16,6 @@ TRADE_QTY = 0.01
 ENTRY_BUFFER = 0.8
 PIP = 1.0
 TP_OFFSET = 100 * PIP
-SPREAD_THRESHOLD = 0.5
 DAILY_TARGET = 1000
 DAILY_LOSS_LIMIT = -700
 
@@ -43,7 +42,7 @@ target_hit = False
 last_tp_time = None
 
 # === UTILS ===
-def now_utc(): return datetime.utcnow()
+def now_utc(): return datetime.now(timezone.utc)
 
 def send_telegram(msg):
     try:
@@ -62,12 +61,11 @@ def log_trade(data):
         sheet.append_row(data)
     except: pass
 
-# === BYBIT SIGNED REQUEST ===
+# === BYBIT REQUESTS ===
 def sign_request(timestamp, recv_window, body=""):
     message = BYBIT_TESTNET_API_KEY + str(timestamp) + str(recv_window) + body
     return hmac.new(BYBIT_TESTNET_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
-# === ORDER PLACEMENT ===
 def place_stop_order(order_type, entry):
     global pending_order, sl_price, tp_price, trade_direction, pending_order_time
 
@@ -78,7 +76,7 @@ def place_stop_order(order_type, entry):
 
     stop_price = round(entry + ENTRY_BUFFER, 2) if side == "Buy" else round(entry - ENTRY_BUFFER, 2)
     tp = round(tp_ref + TP_OFFSET, 2) if side == "Buy" else round(tp_ref - TP_OFFSET, 2)
-    sl = round(entry, 2)
+    sl = round(get_klines('60').iloc[-1]["open"], 2)
 
     timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
@@ -106,55 +104,36 @@ def place_stop_order(order_type, entry):
 
     if r.get("retCode") == 0:
         pending_order = {"id": r["result"]["orderId"], "side": side, "entry": entry}
-        pending_order_time = datetime.utcnow()
+        pending_order_time = now_utc()
         sl_price, tp_price, trade_direction = sl, tp, direction
         send_telegram(f"🟩 *{order_type.upper()}* placed\n📍 Entry: `{entry}`\n🎯 TP: `{tp}`\n🛡 SL: `{sl}`")
         log_trade([str(now_utc()), SYMBOL, order_type, entry, sl, tp, "Pending"])
     else:
         send_telegram(f"❌ Failed to place order: {r.get('retMsg')}")
 
-# === FORMING CANDLE FETCHER ===
-def get_forming_candles(interval='5'):
+# === KLINE CLEANING ===
+def get_klines(interval='5'):
     try:
-        # Step 1: Get last 2 klines
         params = {
             "category": CATEGORY,
             "symbol": SYMBOL,
             "interval": interval,
-            "limit": 2
+            "limit": 100
         }
         r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params=params).json()
         raw = r.get("result", {}).get("list", [])
         if not raw: return pd.DataFrame()
-
         df = pd.DataFrame(raw, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
-        df["start"] = pd.to_numeric(df["start"], errors="coerce")
-        df["time"] = pd.to_datetime(df["start"], unit='ms', errors='coerce')
-
-        # Convert price columns to float
-        df[["open", "high", "low", "close", "volume", "turnover"]] = df[["open", "high", "low", "close", "volume", "turnover"]].astype(float)
-        df = df.dropna(subset=["time", "open", "high", "low", "close"])
-
-        # Step 2: Get ticker
-        ticker = requests.get(f"{BASE_URL_PUBLIC}/v5/market/tickers", params={"category": CATEGORY, "symbol": SYMBOL}).json()
-        ticker_data = ticker.get("result", {}).get("list", [])
-        if not ticker_data: return df
-
-        last_price = float(ticker_data[0]["lastPrice"])
-
-        # Step 3: Update forming candle safely
-        df.at[df.index[-1], "close"] = last_price
-        df.at[df.index[-1], "high"] = max(df.iloc[-1]["high"], last_price)
-        df.at[df.index[-1], "low"] = min(df.iloc[-1]["low"], last_price)
-
+        df = df.astype({col: float for col in ["open", "high", "low", "close"]})
+        df["start"] = pd.to_numeric(df["start"])
+        df["time"] = pd.to_datetime(df["start"], unit='s', utc=True)
         return df
-    except Exception as e:
-        print(f"❌ Error in get_forming_candles({interval}m): {e}")
+    except:
         return pd.DataFrame()
 
-# === INDICATORS ===
 def add_indicators(df):
     if df.empty: return df
+    df = df.copy()
     df["rsi"] = ta.momentum.rsi(df["close"], 14)
     bb = ta.volatility.BollingerBands(df["close"], 20, 2)
     df["bb_mid"] = bb.bollinger_mavg()
@@ -163,21 +142,20 @@ def add_indicators(df):
     return df
 
 def get_bollinger_band_reference(order_type):
-    df = add_indicators(get_forming_candles('5'))
+    df = add_indicators(get_klines('5'))
     if df.empty: return None
     c = df.iloc[-1]
     return c["bb_mid"] if "reversal" in order_type else (c["bb_high"] if "buy" in order_type else c["bb_low"])
 
-# === SIGNAL LOGIC ===
+# === SIGNALS ===
 def check_signal():
     global last_tp_time, target_hit
 
-    if target_hit: return None
-    if last_tp_time and (datetime.utcnow() - last_tp_time).seconds < 1800: return None
+    if target_hit or (last_tp_time and (now_utc() - last_tp_time).seconds < 1800):
+        return None
 
-    df_5m = add_indicators(get_forming_candles('5'))
-    df_1h = add_indicators(get_forming_candles('60'))
-
+    df_5m = add_indicators(get_klines('5'))
+    df_1h = add_indicators(get_klines('60'))
     if df_5m.empty or df_1h.empty:
         return None
 
@@ -186,17 +164,41 @@ def check_signal():
     if 47 <= c5["rsi"] <= 53 or 47 <= c1["rsi"] <= 53:
         return None
 
-    if c5["close"] > c5["bb_mid"] and c5["close"] > c5["open"] and c1["close"] > c1["open"]:
-        return "trend_buy", c5["close"]
-    if c5["close"] < c5["bb_mid"] and c5["close"] < c5["open"] and c1["close"] < c1["open"]:
-        return "trend_sell", c5["close"]
-    if c5["close"] < c5["bb_mid"] and c5["close"] > c5["open"] and c1["close"] > c1["open"]:
-        return "reversal_buy", c5["close"]
-    if c5["close"] > c5["bb_mid"] and c5["close"] < c5["open"] and c1["close"] < c1["open"]:
-        return "reversal_sell", c5["close"]
+    def is_touching_bb(c):
+        return (
+            abs(c["close"] - c["bb_low"]) < 1.0 or
+            abs(c["close"] - c["bb_high"]) < 1.0 or
+            abs(c["close"] - c["bb_mid"]) < 1.0
+        )
+
+    def pip_distance(c, side):
+        return abs(c["bb_high"] - c["close"]) if side == "buy" else abs(c["close"] - c["bb_low"])
+
+    # Trend
+    if c5["close"] > c5["open"] and c5["close"] > c5["bb_mid"]:
+        if c1["close"] > c1["open"] and not is_touching_bb(c1):
+            if pip_distance(c5, "buy") >= 1.0 and not is_touching_bb(c5):
+                return "trend_buy", c5["close"]
+
+    if c5["close"] < c5["open"] and c5["close"] < c5["bb_mid"]:
+        if c1["close"] < c1["open"] and not is_touching_bb(c1):
+            if pip_distance(c5, "sell") >= 1.0 and not is_touching_bb(c5):
+                return "trend_sell", c5["close"]
+
+    # Reversal
+    if c5["close"] < c5["bb_mid"] and c5["close"] > c5["open"]:
+        if c1["close"] > c1["open"] and not is_touching_bb(c1):
+            if abs(c5["close"] - c5["bb_mid"]) >= 1.0:
+                return "reversal_buy", c5["close"]
+
+    if c5["close"] > c5["bb_mid"] and c5["close"] < c5["open"]:
+        if c1["close"] < c1["open"] and not is_touching_bb(c1):
+            if abs(c5["close"] - c5["bb_mid"]) >= 1.0:
+                return "reversal_sell", c5["close"]
+
     return None
 
-# === MAIN BOT LOOP ===
+# === MAIN LOOP ===
 def bot_loop():
     global in_position, last_tp_time, daily_trades, target_hit, pending_order, entry_price
 
@@ -209,7 +211,7 @@ def bot_loop():
                     place_stop_order(order_type, signal_price)
 
             if pending_order and pending_order_time:
-                if not in_position and (datetime.utcnow() - pending_order_time).seconds > 60:
+                if not in_position and (now_utc() - pending_order_time).seconds > 60:
                     in_position = True
                     entry_price = pending_order['entry']
                     send_telegram(f"✅ Trade triggered at `{entry_price}`")
@@ -218,7 +220,7 @@ def bot_loop():
             send_telegram(f"⚠ Error: {e}")
         time.sleep(60)
 
-# === FLASK REPORT SERVER ===
+# === FLASK + DAILY REPORT ===
 app = Flask(__name__)
 
 @app.route('/')
@@ -228,7 +230,7 @@ def home():
 def daily_report():
     global target_hit
     while True:
-        now = datetime.utcnow()
+        now = now_utc()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
         total_pnl = sum(p for p,_ in daily_trades)
@@ -246,7 +248,6 @@ Biggest Loss: {max_loss}
         daily_trades.clear()
         target_hit = False
 
-# === RUN ===
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=daily_report, daemon=True).start()
