@@ -73,6 +73,7 @@ def place_stop_order(order_type, entry):
     side = "Buy" if "buy" in order_type else "Sell"
     direction = "long" if side == "Buy" else "short"
     tp_ref = get_bollinger_band_reference(order_type)
+    if tp_ref is None: return
 
     stop_price = round(entry + ENTRY_BUFFER, 2) if side == "Buy" else round(entry - ENTRY_BUFFER, 2)
     tp = round(tp_ref + TP_OFFSET, 2) if side == "Buy" else round(tp_ref - TP_OFFSET, 2)
@@ -106,37 +107,40 @@ def place_stop_order(order_type, entry):
         pending_order = {"id": r["result"]["orderId"], "side": side, "entry": entry}
         pending_order_time = datetime.utcnow()
         sl_price, tp_price, trade_direction = sl, tp, direction
-        msg = f"🟩 *{order_type.upper()}* placed\n📍 Entry: `{entry}`\n🎯 TP: `{tp}`\n🛡 SL: `{sl}`"
-        send_telegram(msg)
+        send_telegram(f"🟩 *{order_type.upper()}* placed\n📍 Entry: `{entry}`\n🎯 TP: `{tp}`\n🛡 SL: `{sl}`")
         log_trade([str(now_utc()), SYMBOL, order_type, entry, sl, tp, "Pending"])
     else:
         send_telegram(f"❌ Failed to place order: {r.get('retMsg')}")
 
-# === SIGNALS ===
+# === KLINE CLEANING ===
 def get_klines(interval='5'):
-    params = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "interval": interval,
-        "limit": 100
-    }
-    r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params=params).json()
-    df = pd.DataFrame(r['result']['list'], columns=[
-        "start", "open", "high", "low", "close", "volume", "turnover"
-    ])
-
-    # ✅ FIX: clean and convert timestamp
-    df["start"] = pd.to_numeric(df["start"], errors="coerce")
-    df = df.dropna(subset=["start"])
-    df = df[(df["start"] > 1e9) & (df["start"] < 2e10)]
-    df["time"] = pd.to_datetime(df["start"], unit='s', errors='coerce')
-    df = df.dropna(subset=["time"])
-
-    for c in ['open', 'high', 'low', 'close']:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna()
+    try:
+        params = {
+            "category": CATEGORY,
+            "symbol": SYMBOL,
+            "interval": interval,
+            "limit": 100
+        }
+        r = requests.get(f"{BASE_URL_PUBLIC}/v5/market/kline", params=params).json()
+        raw = r.get("result", {}).get("list", [])
+        if not raw: return pd.DataFrame()
+        df = pd.DataFrame(raw, columns=[
+            "start", "open", "high", "low", "close", "volume", "turnover"
+        ])
+        df["start"] = pd.to_numeric(df["start"], errors="coerce")
+        df = df.dropna(subset=["start"])
+        df = df[(df["start"] > 1e9) & (df["start"] < 2e10)]
+        df["time"] = pd.to_datetime(df["start"], unit='s', errors='coerce')
+        df = df.dropna(subset=["time"])
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        return df
+    except:
+        return pd.DataFrame()
 
 def add_indicators(df):
+    if df.empty: return df
     df["rsi"] = ta.momentum.rsi(df["close"], 14)
     bb = ta.volatility.BollingerBands(df["close"], 20, 2)
     df["bb_mid"] = bb.bollinger_mavg()
@@ -146,12 +150,11 @@ def add_indicators(df):
 
 def get_bollinger_band_reference(order_type):
     df = add_indicators(get_klines('5'))
+    if df.empty: return None
     c = df.iloc[-1]
-    if "trend" in order_type:
-        return c["bb_high"] if "buy" in order_type else c["bb_low"]
-    else:
-        return c["bb_mid"]
+    return c["bb_mid"] if "reversal" in order_type else (c["bb_high"] if "buy" in order_type else c["bb_low"])
 
+# === SIGNALS ===
 def check_signal():
     global last_tp_time, target_hit
 
@@ -161,9 +164,13 @@ def check_signal():
     df_5m = add_indicators(get_klines('5'))
     df_1h = add_indicators(get_klines('60'))
 
-    c5 = df_5m.iloc[-1]
-    c1 = df_1h.iloc[-1]
-    if not (47 <= c5["rsi"] <= 53 or 47 <= c1["rsi"] <= 53): return None
+    if df_5m.empty or df_1h.empty:
+        return None
+
+    c5, c1 = df_5m.iloc[-1], df_1h.iloc[-1]
+
+    if 47 <= c5["rsi"] <= 53 or 47 <= c1["rsi"] <= 53:
+        return None
 
     if c5["close"] > c5["bb_mid"] and c5["close"] > c5["open"] and c1["close"] > c1["open"]:
         return "trend_buy", c5["close"]
@@ -177,7 +184,7 @@ def check_signal():
 
 # === MAIN LOOP ===
 def bot_loop():
-    global in_position, last_tp_time, daily_trades, target_hit, pending_order
+    global in_position, last_tp_time, daily_trades, target_hit, pending_order, entry_price
 
     while True:
         try:
@@ -187,7 +194,6 @@ def bot_loop():
                     order_type, signal_price = signal
                     place_stop_order(order_type, signal_price)
 
-            # Simulated fill logic
             if pending_order and pending_order_time:
                 if not in_position and (datetime.utcnow() - pending_order_time).seconds > 60:
                     in_position = True
@@ -211,7 +217,6 @@ def daily_report():
         now = datetime.utcnow()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
-
         total_pnl = sum(p for p,_ in daily_trades)
         win_rate = (sum(1 for _,w in daily_trades if w) / len(daily_trades))*100 if daily_trades else 0
         max_win = max((p for p,_ in daily_trades), default=0)
