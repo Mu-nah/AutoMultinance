@@ -19,7 +19,7 @@ def run_bot():
     API_SECRET = os.getenv("BINANCE_API_SECRET")
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+    SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"]
 
     client = Client(API_KEY, API_SECRET)
 
