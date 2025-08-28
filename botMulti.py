@@ -20,7 +20,11 @@ def run_bot():
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
-    SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAU/USD"]  # note: use XAUUSD, not XAUUSDT
+
+    # Split symbols clearly by source
+    BINANCE_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+    TWELVEDATA_SYMBOLS = ["XAU/USD"]
+    SYMBOLS = BINANCE_SYMBOLS + TWELVEDATA_SYMBOLS
 
     client = Client(API_KEY, API_SECRET)
 
@@ -42,7 +46,7 @@ def run_bot():
         df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
         return df.iloc[-1]
 
-    # --- Twelve Data daily candle (for XAUUSD) ---
+    # --- Twelve Data daily candle (for XAU/USD) ---
     def get_today_candle_twelvedata(symbol):
         for key in TD_API_KEYS:  # try keys one by one
             try:
@@ -59,21 +63,23 @@ def run_bot():
                     }
             except Exception as e:
                 print(f"Twelve Data key {key} failed:", e)
-        raise Exception("All Twelve Data keys failed for XAUUSD")
+        raise Exception("All Twelve Data keys failed for XAU/USD")
 
     while True:
         try:
             for symbol in SYMBOLS:
-                if symbol in ["BTCUSDT", "ETHUSDT"]:
+                if symbol in BINANCE_SYMBOLS:
                     today = get_today_candle_binance(symbol)
                     direction = "bullish" if today['close'] > today['open'] else "bearish"
                     today_date = today['time'].date()
                     open_price, close_price = today['open'], today['close']
-                else:  # XAUUSD from Twelve Data
+                elif symbol in TWELVEDATA_SYMBOLS:
                     today = get_today_candle_twelvedata(symbol)
                     direction = "bullish" if today['close'] > today['open'] else "bearish"
                     today_date = today['time'].date()
                     open_price, close_price = today['open'], today['close']
+                else:
+                    continue
 
                 key = f"{symbol}_{today_date}"
                 if last_direction.get(key) != direction:
