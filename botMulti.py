@@ -20,7 +20,7 @@ def run_bot():
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
-    SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSD"]  # note: use XAUUSD, not XAUUSDT
+    SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAU/USD"]  # note: use XAUUSD, not XAUUSDT
 
     client = Client(API_KEY, API_SECRET)
 
