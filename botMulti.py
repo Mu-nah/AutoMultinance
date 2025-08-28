@@ -11,7 +11,6 @@ def run_bot():
     import time, requests, pandas as pd
     from binance.client import Client
     import os
-    from datetime import datetime
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -21,13 +20,11 @@ def run_bot():
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
 
-    # Split symbols clearly by source
     BINANCE_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
     TWELVEDATA_SYMBOLS = ["XAU/USD"]
     SYMBOLS = BINANCE_SYMBOLS + TWELVEDATA_SYMBOLS
 
     client = Client(API_KEY, API_SECRET)
-
     last_direction = {}
 
     def send_telegram(msg):
@@ -40,19 +37,23 @@ def run_bot():
     # --- Binance daily candle ---
     def get_today_candle_binance(symbol):
         klines = client.futures_klines(symbol=symbol, interval="1d", limit=1)
-        df = pd.DataFrame(klines, columns=['time','open','high','low','close','volume','close_time','qav','trades','tbb','tbq','ignore'])
+        df = pd.DataFrame(klines, columns=[
+            'time','open','high','low','close','volume',
+            'close_time','qav','trades','tbb','tbq','ignore'
+        ])
         for col in ['open','high','low','close']:
             df[col] = df[col].astype(float)
         df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
         return df.iloc[-1]
 
-    # --- Twelve Data daily candle (for XAU/USD) ---
+    # --- Twelve Data daily candle (fetch last *two* so we see the current forming one) ---
     def get_today_candle_twelvedata(symbol):
         for key in TD_API_KEYS:  # try keys one by one
             try:
-                url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1day&outputsize=1&apikey={key}"
+                url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1day&outputsize=2&apikey={key}"
                 r = requests.get(url, timeout=10).json()
                 if "values" in r:
+                    # Take the most recent candle (always index 0)
                     candle = r["values"][0]
                     return {
                         "time": pd.to_datetime(candle["datetime"], utc=True),
@@ -94,7 +95,6 @@ def run_bot():
 # Run the bot in a separate thread
 threading.Thread(target=run_bot, daemon=True).start()
 
-# Run Flask
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5000))
