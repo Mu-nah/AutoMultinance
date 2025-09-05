@@ -18,7 +18,7 @@ def run_bot():
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
 
     SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "EUR/USD", "GBP/JPY"]
-    EMA_PERIOD = 20
+    EMA_PERIOD = 9
 
     # --- Telegram notifier ---
     def send_telegram(msg):
