@@ -1,5 +1,7 @@
+# 🚀 EMA Cross Bot (Twelve Data, 1H candles)
 from flask import Flask
-import threading, time, requests, os
+import threading, os, time, requests
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -7,19 +9,17 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "EMA Crossover Bot Running (Twelve Data)!"
+    return "EMA Cross Bot Running!"
 
 def run_bot():
     load_dotenv()
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple keys rotation
+    TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
 
-    SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "GBP/JPY"]
-    EMA_PERIOD = 20  # adjust EMA length
-
-    last_signal = {}
-    td_index = 0  # rotate keys
+    SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "EUR/USD", "GBP/USD"]
+    EMA_PERIOD = 20
+    last_signal = {}  # {symbol: "above"/"below"}
 
     # --- Telegram notifier ---
     def send_telegram(msg):
@@ -29,54 +29,73 @@ def run_bot():
                 data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
                 timeout=10
             )
-        except Exception as e:
-            print("Telegram error:", e)
+        except:
+            pass
 
-    # --- Twelve Data fetcher ---
-    def get_hourly_candles(symbol):
-        nonlocal td_index
-        for _ in range(len(TD_API_KEYS)):
-            key = TD_API_KEYS[td_index]
-            td_index = (td_index + 1) % len(TD_API_KEYS)  # rotate to next key
+    # --- Twelve Data fetch ---
+    def fetch_candles(symbol, interval="1h", limit=50):
+        for key in TD_API_KEYS:  # try keys in rotation
             try:
                 url = (f"https://api.twelvedata.com/time_series"
-                       f"?symbol={symbol}&interval=1h&outputsize={EMA_PERIOD+3}&apikey={key}")
+                       f"?symbol={symbol}&interval={interval}&outputsize={limit}&apikey={key.strip()}")
                 r = requests.get(url, timeout=10).json()
                 if "values" in r:
                     df = pd.DataFrame(r["values"])
-                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
                     df = df.sort_values("datetime")  # oldest → newest
-                    df['close'] = df['close'].astype(float)
+                    df["close"] = df["close"].astype(float)
                     return df
-            except Exception as e:
-                print(f"Twelve Data key {key} failed: {e}")
-        raise Exception("All Twelve Data keys failed")
+            except:
+                continue
+        return None
+
+    def check_signal(symbol):
+        df = fetch_candles(symbol)
+        if df is None or len(df) < EMA_PERIOD + 2:
+            return None
+
+        df["ema"] = df["close"].ewm(span=EMA_PERIOD).mean()
+        last = df.iloc[-1]   # last closed candle
+        prev = df.iloc[-2]   # previous candle
+
+        # Check cross condition
+        prev_pos = "above" if prev["close"] > prev["ema"] else "below"
+        last_pos = "above" if last["close"] > last["ema"] else "below"
+
+        if prev_pos != last_pos:  # true cross happened
+            return {
+                "symbol": symbol,
+                "time": last["datetime"],
+                "close": last["close"],
+                "ema": last["ema"],
+                "direction": "BULLISH" if last_pos == "above" else "BEARISH"
+            }
+        return None
 
     # --- Main loop ---
     while True:
         try:
+            # Align to top of the next hour
+            now = datetime.utcnow()
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+            wait_time = (next_hour - now).total_seconds()
+            time.sleep(wait_time)
+
             for symbol in SYMBOLS:
-                df = get_hourly_candles(symbol)
-                df['ema'] = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
-
-                prev_close, prev_ema = df.iloc[-2]['close'], df.iloc[-2]['ema']
-                last_close, last_ema = df.iloc[-1]['close'], df.iloc[-1]['ema']
-
-                signal = None
-                if prev_close < prev_ema and last_close > last_ema:
-                    signal = f"✅ *{symbol}* Bullish EMA{EMA_PERIOD} Cross\nPrice: {last_close}"
-                elif prev_close > prev_ema and last_close < last_ema:
-                    signal = f"❌ *{symbol}* Bearish EMA{EMA_PERIOD} Cross\nPrice: {last_close}"
-
-                if signal and last_signal.get(symbol) != signal:
-                    send_telegram(signal)
-                    last_signal[symbol] = signal
+                signal = check_signal(symbol)
+                if signal:
+                    msg = (f"⚡ *{signal['symbol']}* EMA Cross Alert!\n"
+                           f"🕒 {signal['time']}\n"
+                           f"Close: {signal['close']:.3f}\n"
+                           f"EMA{EMA_PERIOD}: {signal['ema']:.3f}\n"
+                           f"Direction: {signal['direction']}")
+                    send_telegram(msg)
 
         except Exception as e:
             print("Error:", e)
+            time.sleep(60)
 
-        time.sleep(3600)  # check every 1 hr
-# Run in background thread
+# Run bot in background
 threading.Thread(target=run_bot, daemon=True).start()
 
 if __name__ == "__main__":
