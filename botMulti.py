@@ -75,8 +75,7 @@ def run_bot():
         except Exception as e:
             print("Error:", e)
 
-        time.sleep(60)  # check every 1 minute
-
+        time.sleep(3600)  # check every 1 hr
 # Run in background thread
 threading.Thread(target=run_bot, daemon=True).start()
 
