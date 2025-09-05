@@ -1,7 +1,7 @@
 # 🚀 EMA Cross Bot (Twelve Data, 1H candles)
 from flask import Flask
 import threading, os, time, requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -17,9 +17,8 @@ def run_bot():
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
 
-    SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "EUR/USD", "GBP/USD"]
+    SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "EUR/USD", "GBP/JPY"]
     EMA_PERIOD = 20
-    last_signal = {}  # {symbol: "above"/"below"}
 
     # --- Telegram notifier ---
     def send_telegram(msg):
@@ -49,6 +48,7 @@ def run_bot():
                 continue
         return None
 
+    # --- Cross check ---
     def check_signal(symbol):
         df = fetch_candles(symbol)
         if df is None or len(df) < EMA_PERIOD + 2:
@@ -58,24 +58,29 @@ def run_bot():
         last = df.iloc[-1]   # last closed candle
         prev = df.iloc[-2]   # previous candle
 
-        # Check cross condition
-        prev_pos = "above" if prev["close"] > prev["ema"] else "below"
-        last_pos = "above" if last["close"] > last["ema"] else "below"
-
-        if prev_pos != last_pos:  # true cross happened
+        # Explicit cross detection
+        if prev["close"] > prev["ema"] and last["close"] < last["ema"]:
             return {
                 "symbol": symbol,
                 "time": last["datetime"],
                 "close": last["close"],
                 "ema": last["ema"],
-                "direction": "BULLISH" if last_pos == "above" else "BEARISH"
+                "direction": "BEARISH"
+            }
+        elif prev["close"] < prev["ema"] and last["close"] > last["ema"]:
+            return {
+                "symbol": symbol,
+                "time": last["datetime"],
+                "close": last["close"],
+                "ema": last["ema"],
+                "direction": "BULLISH"
             }
         return None
 
     # --- Main loop ---
     while True:
         try:
-            # Align to top of the next hour
+            # Align to the next full hour
             now = datetime.utcnow()
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
             wait_time = (next_hour - now).total_seconds()
