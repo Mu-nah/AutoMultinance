@@ -20,6 +20,9 @@ def run_bot():
     SYMBOLS = ["XAU/USD", "AUD/USD", "GBP/USD", "USD/JPY", "EUR/USD", "GBP/JPY"]
     EMA_PERIOD = 9
 
+    # --- Store last cross direction ---
+    last_cross = {s: None for s in SYMBOLS}
+
     # --- Telegram notifier ---
     def send_telegram(msg):
         try:
@@ -58,23 +61,13 @@ def run_bot():
         last = df.iloc[-1]   # last closed candle
         prev = df.iloc[-2]   # previous candle
 
-        # Explicit cross detection
+        # Cross detection
         if prev["close"] > prev["ema"] and last["close"] < last["ema"]:
-            return {
-                "symbol": symbol,
-                "time": last["datetime"],
-                "close": last["close"],
-                "ema": last["ema"],
-                "direction": "BEARISH"
-            }
+            return {"symbol": symbol, "time": last["datetime"], "close": last["close"],
+                    "ema": last["ema"], "direction": "BEARISH"}
         elif prev["close"] < prev["ema"] and last["close"] > last["ema"]:
-            return {
-                "symbol": symbol,
-                "time": last["datetime"],
-                "close": last["close"],
-                "ema": last["ema"],
-                "direction": "BULLISH"
-            }
+            return {"symbol": symbol, "time": last["datetime"], "close": last["close"],
+                    "ema": last["ema"], "direction": "BULLISH"}
         return None
 
     # --- Main loop ---
@@ -88,7 +81,8 @@ def run_bot():
 
             for symbol in SYMBOLS:
                 signal = check_signal(symbol)
-                if signal:
+                if signal and signal["direction"] != last_cross[symbol]:
+                    last_cross[symbol] = signal["direction"]  # update memory
                     msg = (f"⚡ *{signal['symbol']}* EMA Cross Alert!\n"
                            f"🕒 {signal['time']}\n"
                            f"Close: {signal['close']:.3f}\n"
@@ -97,7 +91,6 @@ def run_bot():
                     send_telegram(msg)
 
         except Exception as e:
-            print("Error:", e)
             time.sleep(60)
 
 # Run bot in background
