@@ -17,7 +17,7 @@ def run_bot():
     CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")  # multiple Twelve Data keys
 
-    SYMBOLS = ["XAU/USD", "AUD/USD", "USD/CAD", "USD/JPY", "EUR/USD"]
+    SYMBOLS = ["XAU/USD", "AUD/USD", "USD/CAD", "USD/JPY", "EUR/USD", "GBP/JPY"]
     EMA_PERIOD = 9
 
     # --- Store last cross direction ---
